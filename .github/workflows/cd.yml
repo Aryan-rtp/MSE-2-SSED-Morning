@@ -14,20 +14,22 @@ concurrency:
 
 jobs:
   publish:
-    name: Publish student's images to Docker Hub
+    name: Build, publish and verify Docker images
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Checkout student's repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Validate required Docker Hub secrets
+      - name: Validate required secrets
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
         run: |
           test -n "$DOCKERHUB_USERNAME" || (echo "Missing DOCKERHUB_USERNAME secret" && exit 1)
           test -n "$DOCKERHUB_TOKEN" || (echo "Missing DOCKERHUB_TOKEN secret" && exit 1)
+          test -n "$POSTGRES_PASSWORD" || (echo "Missing POSTGRES_PASSWORD secret" && exit 1)
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -38,40 +40,54 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push backend
+      - name: Build backend image
         uses: docker/build-push-action@v6
         with:
           context: ./backend
-          push: true
+          load: true
           tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/taskflow-backend:latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/taskflow-backend:${{ github.sha }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/backend:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/backend:${{ github.sha }}
 
-      - name: Build and push frontend
+      - name: Publish backend image
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: docker push --all-tags "$DOCKERHUB_USERNAME/backend"
+
+      - name: Build frontend image
         uses: docker/build-push-action@v6
         with:
           context: ./frontend
-          push: true
+          load: true
           tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/taskflow-frontend:latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/taskflow-frontend:${{ github.sha }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/frontend:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/frontend:${{ github.sha }}
 
-      - name: Create deployment environment file
+      - name: Publish frontend image
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: docker push --all-tags "$DOCKERHUB_USERNAME/frontend"
+
+      - name: Create temporary deployment environment
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
         run: |
-          cat > .env <<'EOF'
-          POSTGRES_DB=taskflow
-          POSTGRES_USER=taskflow_user
-          POSTGRES_PASSWORD=deployment_change_me
-          DATABASE_URL=postgresql://taskflow_user:deployment_change_me@postgres:5432/taskflow
-          REDIS_URL=redis://redis:6379
-          JWT_SECRET=replace_with_a_long_random_secret
-          PORT=3000
-          DOCKERHUB_USERNAME=${{ secrets.DOCKERHUB_USERNAME }}
-          EOF
+          DB_PASSWORD_URL="$(node -e 'process.stdout.write(encodeURIComponent(process.env.POSTGRES_PASSWORD))')"
+          JWT_SECRET="$(openssl rand -hex 32)"
+          {
+            printf 'POSTGRES_DB=taskflow\n'
+            printf 'POSTGRES_USER=taskflow_user\n'
+            # Single quotes stop Compose from expanding characters such as $ and #.
+            printf "POSTGRES_PASSWORD='%s'\n" "$POSTGRES_PASSWORD"
+            printf 'DATABASE_URL=postgresql://taskflow_user:%s@postgres:5432/taskflow\n' "$DB_PASSWORD_URL"
+            printf 'REDIS_URL=redis://redis:6379\n'
+            printf 'JWT_SECRET=%s\n' "$JWT_SECRET"
+            printf 'DOCKERHUB_USERNAME=%s\n' "$DOCKERHUB_USERNAME"
+          } > .env
 
       - name: Validate image-based deployment Compose
         run: |
-          grep -q 'image:' docker-compose.deploy.yml
           if grep -Eq '^[[:space:]]+build:' docker-compose.deploy.yml; then
             echo "Deployment Compose must use published images, not build:"
             exit 1
@@ -81,27 +97,36 @@ jobs:
       - name: Pull published images
         run: docker compose -f docker-compose.deploy.yml pull
 
-      - name: Deploy using Docker Hub images
+      - name: Deploy published images
         run: docker compose -f docker-compose.deploy.yml up -d
 
-      - name: Verify deployment
+      - name: Verify backend health
         run: |
-          for attempt in $(seq 1 40); do
+          for _ in $(seq 1 40); do
             if curl --fail --silent http://localhost:3000/health; then
               echo
-              echo "Deployment backend is healthy"
-              break
-            fi
-            if [ "$attempt" -eq 40 ]; then
-              docker compose -f docker-compose.deploy.yml ps
-              docker compose -f docker-compose.deploy.yml logs --no-color
-              exit 1
+              echo "Backend health check passed"
+              exit 0
             fi
             sleep 3
           done
-          curl --fail --silent http://localhost:8080/ > /dev/null
+          docker compose -f docker-compose.deploy.yml ps
+          docker compose -f docker-compose.deploy.yml logs --no-color
+          exit 1
 
-      - name: Run API tests against Docker Hub deployment
+      - name: Verify frontend accessibility
+        run: |
+          for _ in $(seq 1 20); do
+            if curl --fail --silent http://localhost:8080/ > /dev/null; then
+              echo "Frontend accessibility check passed"
+              exit 0
+            fi
+            sleep 3
+          done
+          docker compose -f docker-compose.deploy.yml logs --no-color frontend
+          exit 1
+
+      - name: Run API tests against deployment
         working-directory: tests
         env:
           BASE_URL: http://localhost:3000
@@ -115,8 +140,8 @@ jobs:
           {
             echo "## Docker Hub publication"
             echo ""
-            echo "- Backend: \`${{ secrets.DOCKERHUB_USERNAME }}/taskflow-backend:latest\`"
-            echo "- Frontend: \`${{ secrets.DOCKERHUB_USERNAME }}/taskflow-frontend:latest\`"
+            echo "- Backend: \`${{ secrets.DOCKERHUB_USERNAME }}/backend:latest\`"
+            echo "- Frontend: \`${{ secrets.DOCKERHUB_USERNAME }}/frontend:latest\`"
             echo "- Commit: \`${GITHUB_SHA}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
